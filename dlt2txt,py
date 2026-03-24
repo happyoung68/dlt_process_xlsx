@@ -1,0 +1,378 @@
+import struct
+import re
+from datetime import datetime
+
+
+class LogParser:
+    """DLT日志解析器（适配non-verbose模式，新增cal_timestamp提取）"""
+    MAGIC_HEADER = b'DLT\x01'
+    STORAGE_HEADER_LEN = 16
+    STANDARD_HEADER_LEN = 16
+    EXTENDED_HEADER_LEN = 10
+    MIN_MSG_LENGTH = 42
+
+    MESSAGE_TYPE_MAP = {
+        0x00: "LOG",
+        0x01: "APP_TRACE",
+        0x02: "NW_TRACE",
+        0x03: "CONTROL"
+    }
+    LOG_LEVEL_MAP = {
+        0x01: "FATAL",
+        0x02: "ERROR",
+        0x03: "WARN",
+        0x04: "INFO",
+        0x05: "DEBUG",
+        0x06: "VERBOSE"
+    }
+    DATA_SIZE_MAP = {0x01: 1, 0x02: 2, 0x03: 4, 0x04: 8}
+    ENCODING_MAP = {0x00: 'ascii', 0x01: 'utf-8', 0x02: 'hex_ascii', 0x04: 'utf-8'}
+
+    STORAGE_HEADER_FMT = '<Ii'
+    LENGTH_FMT = '>H'
+    SESSION_ID_FMT = '>I'
+    TIMESTAMP_FMT = '>I'
+    STR_LEN_FMT = '<H'
+    NON_VERBOSE_MSG_ID_LEN = 4
+    DLT_SEPARATOR = b'DLT\x01'
+    CAL_TIMESTAMP_PATTERN = re.compile(r'\[\#:(\d+\.\d+)s\]')
+
+    @classmethod
+    def parse_storage_header(cls, hex_data):
+        if len(hex_data) < cls.STORAGE_HEADER_LEN:
+            raise ValueError("StorageHeader长度不足16字节")
+        if hex_data[:4] != cls.MAGIC_HEADER:
+            raise ValueError("无效的DLT文件格式")
+
+        seconds, microseconds = struct.unpack(cls.STORAGE_HEADER_FMT, hex_data[4:12])
+        ecuid = hex_data[12:16].decode('ascii', errors='ignore')
+        abs_time = datetime.fromtimestamp(seconds + microseconds / 1000000.0)
+        time_str = f"{abs_time.strftime('%Y/%m/%d %H:%M:%S.')}{microseconds:06d}"
+
+        return {'magic': cls.MAGIC_HEADER.hex(), 'seconds': seconds, 'microseconds': microseconds, 'ecuid': ecuid,
+                'time': time_str}
+
+    @classmethod
+    def parse_standard_header(cls, hex_data):
+        if len(hex_data) < cls.STANDARD_HEADER_LEN:
+            raise ValueError("StandardHeader长度不足16字节")
+
+        header_type_byte = hex_data[0]
+        use_extended_header = (header_type_byte & 0x01) != 0
+        msb_first = (header_type_byte & 0x02) != 0
+        with_ecuid = (header_type_byte & 0x04) != 0
+        with_session_id = (header_type_byte & 0x08) != 0
+        with_timestamp = (header_type_byte & 0x10) != 0
+        version_number = (header_type_byte >> 5) & 0x07
+
+        message_counter = hex_data[1]
+        length = struct.unpack(cls.LENGTH_FMT, hex_data[2:4])[0]
+
+        offset = 4
+        ecuid = ""
+        if with_ecuid and offset + 4 <= len(hex_data):
+            ecuid = hex_data[offset:offset + 4].decode('ascii', errors='ignore')
+            offset += 4
+
+        session_id = 0
+        if with_session_id and offset + 4 <= len(hex_data):
+            session_id = struct.unpack(cls.SESSION_ID_FMT, hex_data[offset:offset + 4])[0]
+            offset += 4
+
+        timestamp = 0.0
+        if with_timestamp and offset + 4 <= len(hex_data):
+            timestamp = struct.unpack(cls.TIMESTAMP_FMT, hex_data[offset:offset + 4])[0] / 10000.0
+
+        return {'header_type': header_type_byte, 'use_extended_header': use_extended_header, 'msb_first': msb_first,
+                'with_ecuid': with_ecuid, 'with_session_id': with_session_id, 'with_timestamp': with_timestamp,
+                'version_number': version_number, 'message_counter': message_counter, 'length': length,
+                'ecuid': ecuid, 'session_id': session_id, 'timestamp': timestamp}
+
+    @classmethod
+    def parse_extended_header(cls, hex_data):
+        if len(hex_data) < cls.EXTENDED_HEADER_LEN:
+            raise ValueError("ExtendedHeader长度不足10字节")
+
+        message_info = hex_data[0]
+        mode = (message_info & 0x01) != 0
+        message_type_bits = (message_info >> 1) & 0x07
+        message_type_info_bits = (message_info >> 4) & 0x0F
+
+        message_type = cls.MESSAGE_TYPE_MAP.get(message_type_bits, f"RESERVED_{message_type_bits}")
+        message_type_info = cls.LOG_LEVEL_MAP.get(message_type_info_bits, "") if message_type == "LOG" else ""
+
+        num_arguments = hex_data[1]
+        application_id = hex_data[2:6].decode('ascii', errors='ignore').replace('\x00', '')
+        context_id = hex_data[6:10].decode('ascii', errors='ignore').replace('\x00', '')
+
+        return {'message_info': message_info, 'mode': mode, 'message_type': message_type,
+                'message_type_info': message_type_info, 'num_arguments': num_arguments,
+                'application_id': application_id, 'context_id': context_id}
+
+    @classmethod
+    def parse_payload(cls, hex_data, num_arguments, msb_first, mode):
+        if not mode:
+            return cls._parse_non_verbose_payload(hex_data)
+
+        payload_parts = []
+        payload_p_parts = []
+        offset = 0
+        total_length = len(hex_data)
+        data_size_map = cls.DATA_SIZE_MAP
+        encoding_map = cls.ENCODING_MAP
+        str_len_fmt = cls.STR_LEN_FMT
+        max_offset = total_length - 4
+
+        for _arg_idx in range(num_arguments):
+            if offset > max_offset:
+                break
+
+            type_info = int.from_bytes(hex_data[offset:offset + 4], 'little')
+            offset += 4
+
+            data_type_length = type_info & 0x0F
+            is_bool = (type_info & 0x10) != 0
+            is_sint = (type_info & 0x20) != 0
+            is_usint = (type_info & 0x40) != 0
+            is_float = (type_info & 0x80) != 0
+            is_string = (type_info & 0x200) != 0
+            is_raw = (type_info & 0x400) != 0
+            string_code = (type_info >> 15) & 0x07
+
+            result = ""
+            group_part = ""
+            is_special_string = False
+
+            if string_code == 0x04:
+                is_string = True
+                is_special_string = True
+                num_arguments = 1
+
+            if is_string:
+                if is_special_string:
+                    if offset + 2 > total_length:
+                        result = ""
+                    else:
+                        str_len = struct.unpack('>H', hex_data[offset:offset + 2])[0]
+                        offset += 2
+                        if str_len <= 0 or offset + str_len > total_length:
+                            result = ""
+                        else:
+                            string_data = hex_data[offset:offset + str_len]
+                            offset += str_len
+                            encoding = encoding_map.get(string_code, 'ascii')
+                            result = string_data.decode(encoding, errors='ignore')
+                            group_part = result
+                    payload_parts.append(result)
+                    payload_p_parts.append(group_part)
+                    break
+                else:
+                    if offset + 2 > total_length:
+                        break
+                    str_len = struct.unpack(str_len_fmt, hex_data[offset:offset + 2])[0]
+                    offset += 2
+                    if offset + str_len > total_length or str_len == 0:
+                        break
+
+                    string_data = hex_data[offset:offset + str_len]
+                    offset += str_len
+                    encoding = encoding_map.get(string_code, 'ascii')
+
+                    if encoding == 'hex_ascii':
+                        hex_str = string_data.hex() if msb_first else string_data[::-1].hex()
+                        result = f"0x{hex_str.upper()}"
+                    else:
+                        result = string_data.decode(encoding, errors='ignore')
+                        group_part = result
+
+            elif is_raw:
+                if offset + 2 > total_length:
+                    break
+                raw_len = struct.unpack(str_len_fmt, hex_data[offset:offset + 2])[0]
+                offset += 2
+                if offset + raw_len > total_length or raw_len == 0:
+                    break
+
+                raw_data = hex_data[offset:offset + raw_len]
+                offset += raw_len
+                result = raw_data.hex(' ', 1)
+                group_part = f"{{arg.{(_arg_idx + 1):02d}, raw}}"
+
+            elif is_sint or is_usint or is_float or is_bool:
+                data_size = data_size_map.get(data_type_length, 0)
+                if data_size == 0 or offset + data_size > total_length:
+                    break
+
+                data_bytes = hex_data[offset:offset + data_size]
+                offset += data_size
+                fmt_prefix = '>' if msb_first else '<'
+                fmt = ""
+
+                if is_sint:
+                    fmt = f"{fmt_prefix}{'bhi'[data_size // 2]}" if data_size in (1, 2, 4) else ""
+                elif is_usint:
+                    fmt = f"{fmt_prefix}{'BHI'[data_size // 2]}" if data_size in (1, 2, 4) else ""
+
+                is_hex_format = False
+                if fmt:
+                    try:
+                        result = str(struct.unpack(fmt, data_bytes)[0])
+                    except struct.error:
+                        result = ""
+
+                if is_usint and string_code == 0x02 and result:
+                    hex_str = data_bytes.hex() if msb_first else data_bytes[::-1].hex()
+                    result = f"0x{hex_str.upper()}"
+                    is_hex_format = True
+
+                if is_bool:
+                    datatype = 'bool'
+                elif is_sint:
+                    datatype = f"sint{ {1: '8', 2: '16', 4: '32', 8: '64'}[data_size]}"
+                elif is_usint:
+                    datatype = f"uint{ {1: '8', 2: '16', 4: '32', 8: '64'}[data_size]}"
+                    if is_hex_format:
+                        datatype += "_hexstr"
+                elif is_float:
+                    datatype = f"float{ {4: '32', 8: '64'}[data_size]}"
+                else:
+                    datatype = ''
+
+                group_part = f"{{arg.{(_arg_idx + 1):02d}, {datatype}}}" if datatype else result
+            else:
+                result = hex_data[offset:].hex(' ', 1) if offset < total_length else ""
+                offset = total_length
+                group_part = result
+
+            payload_parts.append(result)
+            payload_p_parts.append(group_part)
+
+        payload = " ".join(payload_parts).replace('\x00', '').strip()
+        payload_p = " ".join(payload_p_parts).replace('\x00', '').strip()
+        return payload, payload_p
+
+    @classmethod
+    def _parse_non_verbose_payload(cls, hex_data):
+        try:
+            if len(hex_data) < cls.NON_VERBOSE_MSG_ID_LEN:
+                message_id_str = "[0]"
+                data_bytes = b""
+            else:
+                message_id = struct.unpack('>I', hex_data[:cls.NON_VERBOSE_MSG_ID_LEN])[0]
+                message_id_str = f"[{message_id}]"
+                data_bytes = hex_data[cls.NON_VERBOSE_MSG_ID_LEN:]
+                separator_idx = data_bytes.find(cls.DLT_SEPARATOR)
+                if separator_idx != -1:
+                    data_bytes = data_bytes[:separator_idx]
+
+            if not data_bytes:
+                data_part = ""
+            else:
+                ascii_str = data_bytes.decode('ascii', errors='ignore')
+                hex_str = data_bytes.hex(' ', 1)
+                data_part = f"{ascii_str}|{hex_str}"
+
+            payload = f"{message_id_str} {data_part}".strip()
+            return payload, payload
+        except Exception:
+            return "", ""
+
+    @classmethod
+    def split_dlt_messages(cls, file_data):
+        messages = []
+        start = 0
+        magic = cls.MAGIC_HEADER
+        magic_len = len(magic)
+        file_len = len(file_data)
+
+        while start < file_len:
+            next_start = file_data.find(magic, start + magic_len)
+            if next_start == -1:
+                messages.append(file_data[start:])
+                break
+            messages.append(file_data[start:next_start])
+            start = next_start
+        return messages
+
+    @classmethod
+    def _extract_cal_timestamp(cls, ecuid, payload, timestamp):
+        try:
+            if ecuid in ["CCU0", "CCU1"]:
+                match = cls.CAL_TIMESTAMP_PATTERN.search(payload)
+                if match:
+                    return round(float(match.group(1)), 4)
+            return round(timestamp, 4) if timestamp is not None else 0.0
+        except Exception:
+            return round(timestamp, 4) if timestamp is not None else 0.0
+
+    @classmethod
+    def parse_dlt_message(cls, hex_data, msg_index):
+        if len(hex_data) < cls.MIN_MSG_LENGTH:
+            return None
+        try:
+            storage_header = cls.parse_storage_header(hex_data[:cls.STORAGE_HEADER_LEN])
+            standard_header = cls.parse_standard_header(
+                hex_data[cls.STORAGE_HEADER_LEN:cls.STORAGE_HEADER_LEN + cls.STANDARD_HEADER_LEN])
+            payload_length = standard_header['length'] - cls.STANDARD_HEADER_LEN - cls.EXTENDED_HEADER_LEN
+
+            if payload_length < 0:
+                return None
+
+            extended_header = cls.parse_extended_header(hex_data[32:42])
+            payload_data = hex_data[42:42 + payload_length]
+            payload, payload_p = cls.parse_payload(payload_data, extended_header['num_arguments'],
+                                                   standard_header['msb_first'], extended_header['mode'])
+            cal_timestamp = cls._extract_cal_timestamp(storage_header['ecuid'], payload, standard_header['timestamp'])
+
+            return (
+                msg_index, storage_header['time'], standard_header['timestamp'], cal_timestamp,
+                standard_header['message_counter'], storage_header['ecuid'],
+                extended_header['application_id'], extended_header['context_id'],
+                standard_header['session_id'], extended_header['message_type'],
+                extended_header['message_type_info'], 'verbose' if extended_header['mode'] else 'non-verbose',
+                extended_header['num_arguments'], payload, payload_p
+            )
+        except Exception:
+            return None
+
+
+# ===================== 核心功能：舍弃第4列、第15列 =====================
+def convert_dlt_to_txt(dlt_file_path: str):
+    import os
+    if not os.path.exists(dlt_file_path):
+        print(f"❌ 错误：文件 {dlt_file_path} 不存在")
+        return
+
+    with open(dlt_file_path, 'rb') as f:
+        file_data = f.read()
+
+    messages = LogParser.split_dlt_messages(file_data)
+    parsed_results = []
+    for idx, msg in enumerate(messages):
+        res = LogParser.parse_dlt_message(msg, idx)
+        if res:
+            # 舍弃索引3（第4列）和索引14（第15列）
+            filtered_row = list(res[:3]) + list(res[4:14])
+            parsed_results.append(filtered_row)
+
+    if not parsed_results:
+        print("⚠️ 未解析到有效日志")
+        return
+
+    txt_path = os.path.splitext(dlt_file_path)[0] + ".txt"
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        for row in parsed_results:
+            row_str = " ".join([str(item).replace('\t', ' ').replace('\x00', '').strip() for item in row])
+            f.write(row_str + "\n")
+
+    print(f"✅ 转换完成！")
+    print(f"输入：{dlt_file_path}")
+    print(f"输出：{txt_path}")
+    print(f"日志条数：{len(parsed_results)}")
+
+
+# ===================== 运行 =====================
+if __name__ == '__main__':
+    # 替换为你的DLT文件路径
+    INPUT_DLT = r"250812_080010.dlt"
+    convert_dlt_to_txt(INPUT_DLT)
